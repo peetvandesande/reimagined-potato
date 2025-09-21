@@ -2,3 +2,6 @@
 .env
 
 backend/uploads/*
+
+ldap/init.ldif
+

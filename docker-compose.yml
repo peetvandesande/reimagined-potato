@@ -44,6 +44,12 @@ services:
     ports:
       - "389:389"
     # use the upstream image and populate at runtime via ldapadd
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost:389 -b 'dc=example,dc=org' '(objectclass=*)' -LLL >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
   phpldapadmin:
     image: osixia/phpldapadmin:0.9.0
@@ -51,6 +57,18 @@ services:
       - PHPLDAPADMIN_LDAP_HOSTS=ldap
     ports:
       - "6443:6443"
+
+  # One-shot init service: waits for ldap to be ready then applies our canonical init.ldif.
+  ldap-init:
+    image: osixia/openldap:1.5.0
+    depends_on:
+      - ldap
+    entrypoint: ["/bin/sh","-c"]
+    command: "/init-scripts/ldap_init_compose.sh"
+    volumes:
+      - ./backend/ldap/init.ldif:/init.ldif:ro
+      - ./backend/scripts/ldap_init_compose.sh:/init-scripts/ldap_init_compose.sh:ro
+    restart: "no"
 
   postgres:
     image: postgres:15-alpine

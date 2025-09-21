@@ -1,0 +1,3 @@
+# username:password (plain text, one per line)
+peet:peetpass1
+other:otherpass1

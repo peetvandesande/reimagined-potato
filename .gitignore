@@ -1,0 +1,4 @@
+*test.js
+.env
+
+backend/uploads/*

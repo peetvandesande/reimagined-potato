@@ -10,7 +10,7 @@ Quick start
 docker compose up -d --build
 ```
 
-3. Open the frontend at http://localhost:3000 and log in using credentials from `backend/users.txt` (example: `peet:peetpass1`).
+3. Open the frontend at http://localhost:3000 and log in using credentials from `backend/users.txt` (example: `user:userpass1`).
 
 What changed
 - `.env` — central defaults for backend and frontend (API base, WS base, cookie name, Redis/Postgres URLs, prefixes and TTLs).

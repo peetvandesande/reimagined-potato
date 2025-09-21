@@ -12,7 +12,7 @@ function parseUsersFile() {
   return users;
 }
 
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
   const auth = req.headers['authorization'];
   // If no Authorization header, treat as unauthorized (but avoid browser native prompt for assets)
   if (!auth) {
@@ -28,7 +28,7 @@ function authMiddleware(req, res, next) {
     return res.status(401).send('Authentication required.');
   }
   const token = auth.split(' ')[1];
-  const userFromJwt = verifyJwt(token);
+  const userFromJwt = await verifyJwt(token);
   if (userFromJwt) {
     req.user = userFromJwt; // { username, roles }
     return next();
@@ -78,56 +78,109 @@ async function ldapAuthenticate(username, password) {
   const url = cfg.LDAP_URL || 'ldap://localhost:389';
   const userDn = `uid=${username},${peopleOu},${base}`;
   return new Promise((resolve) => {
-    const client = ldap.createClient({ url, reconnect: false });
+  const client = ldap.createClient({ url, reconnect: false, timeout: 5000, connectTimeout: 5000 });
+    // Guard against network/DNS errors from the ldap client which would otherwise emit an
+    // uncaught 'error' and crash the server. On error, cleanup and resolve as unauthenticated.
+    client.on('error', (err) => {
+      try { client.unbind(()=>{}); } catch (e) {}
+      console.error('LDAP client error', err && err.message ? err.message : err);
+      return resolve(null);
+    });
     // attempt to bind as the user to verify password
     client.bind(userDn, password, (err) => {
       if (err) {
         try { client.unbind(()=>{}); } catch (e) {}
         return resolve(null);
       }
+  // user bind successful
       // After successful bind, try to load cached roles from Redis
       (async () => {
         try {
           const cacheKey = `${cfg.LDAP_CACHE_PREFIX}${username}`;
-          const cached = await redis.get(cacheKey).catch(()=>null);
-          if (cached) {
+            const cached = await redis.get(cacheKey).catch(()=>null);
+            if (cached) {
+              try { client.unbind(()=>{}); } catch (e) {}
+              const roles = JSON.parse(cached || '[]');
+              // ldap roles cache hit
+              return resolve({ username, roles });
+            }
+          } catch (e) { /* ignore cache errors */ }
+          // If no cache, delegate to ldapGetRoles which will try anonymous search and then admin bind if needed.
+          try {
+            const roles = await ldapGetRoles(username).catch(()=>[]);
             try { client.unbind(()=>{}); } catch (e) {}
-            const roles = JSON.parse(cached || '[]');
+            // cache roles for subsequent logins
+            try { await redis.set(`${cfg.LDAP_CACHE_PREFIX}${username}`, JSON.stringify(roles || []), { EX: cfg.LDAP_CACHE_TTL_SECONDS }).catch(()=>{}); } catch (e) {}
             return resolve({ username, roles });
+          } catch (e) {
+            try { client.unbind(()=>{}); } catch (e) {}
+            return resolve({ username, roles: [] });
           }
-        } catch (e) { /* ignore cache errors */ }
-        // if no cache, search for groups that list this user as a member
-        const opts = { filter: `(member=${userDn})`, scope: 'sub', attributes: ['cn'] };
-        const groupsBase = `${groupsOu},${base}`;
-        const roles = [];
-        client.search(groupsBase, opts, (err, res) => {
-          if (err) {
-            try { client.unbind(()=>{}); } catch (e) {}
-            return resolve({ username, roles });
-          }
-          res.on('searchEntry', (entry) => {
-            const obj = entry.object || {};
-            const cn = obj.cn;
-            if (Array.isArray(cn)) cn.forEach(c => roles.push(String(c)));
-            else if (cn) roles.push(String(cn));
-          });
-          res.on('error', async () => {
-            try { client.unbind(()=>{}); } catch (e) {}
-            resolve({ username, roles });
-          });
-          res.on('end', async () => {
-            try { client.unbind(()=>{}); } catch (e) {}
-            // cache roles in Redis for faster next login
-            try {
-              const cacheKey = `${cfg.LDAP_CACHE_PREFIX}${username}`;
-              await redis.set(cacheKey, JSON.stringify(roles || []), { EX: cfg.LDAP_CACHE_TTL_SECONDS }).catch(()=>{});
-            } catch (e) {}
-            resolve({ username, roles });
-          });
-        });
       })();
     });
   });
+}
+
+// Query LDAP for groups that include this user as a member. Try anonymous search first,
+// fall back to admin bind if LDAP_ADMIN_PASSWORD is provided in env. Returns [] on error.
+async function ldapGetRoles(username) {
+  const base = cfg.LDAP_BASE_DN || 'dc=example,dc=org';
+  const peopleOu = cfg.LDAP_PEOPLE_OU || 'ou=people';
+  const groupsOu = cfg.LDAP_GROUPS_OU || 'ou=groups';
+  const url = cfg.LDAP_URL || 'ldap://localhost:389';
+  const userDn = `uid=${username},${peopleOu},${base}`;
+  const groupsBase = `${groupsOu},${base}`;
+  try {
+  const client = ldap.createClient({ url, reconnect: false, timeout: 2000, connectTimeout: 2000 });
+    // avoid uncaught error events from the ldap client when LDAP is unreachable
+    client.on('error', (err) => {
+      try { client.unbind(()=>{}); } catch (e) {}
+    });
+  let boundAsAdmin = false;
+  // ldapGetRoles starting
+    // helper to perform the search
+    const roles = [];
+    const doSearch = () => new Promise((resolve) => {
+      const opts = { filter: `(member=${userDn})`, scope: 'sub', attributes: ['cn'] };
+      client.search(groupsBase, opts, (err, res) => {
+        if (err) return resolve(roles);
+        res.on('searchEntry', (entry) => {
+          const obj = entry.object || {};
+          const cn = obj.cn;
+          if (Array.isArray(cn)) cn.forEach(c => roles.push(String(c)));
+          else if (cn) roles.push(String(cn));
+        });
+        res.on('error', () => resolve(roles));
+        res.on('end', () => resolve(roles));
+      });
+    });
+    // If admin credentials are available, prefer admin bind (more reliable than anonymous)
+    const adminPass = process.env.LDAP_ADMIN_PASSWORD;
+    if (adminPass) {
+      try {
+        await new Promise((resolve, reject) => client.bind(`cn=admin,${base}`, adminPass, (err) => err ? reject(err) : resolve()));
+        boundAsAdmin = true;
+        const r2 = await doSearch();
+        try { client.unbind(()=>{}); } catch (e) {}
+        return r2;
+      } catch (err) {
+        // admin bind/search failed; fall through to anonymous attempt
+        try { client.unbind(()=>{}); } catch (e) {}
+      }
+    }
+    // try anonymous as a fallback
+    try {
+      const r = await doSearch();
+  // anonymous search returned
+      try { client.unbind(()=>{}); } catch (e) {}
+      return r;
+    } catch (e) {
+      try { client.unbind(()=>{}); } catch (e) {}
+      return [];
+    }
+  } catch (err) {
+    return [];
+  }
 }
 
 
@@ -462,6 +515,14 @@ app.post('/api/login', express.json(), async (req, res) => {
   if (!authed) {
     const users = parseUsersFile();
     if (!users[username] || users[username] !== password) return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    // attempt to enrich local auth with LDAP group membership if LDAP is configured
+    if (cfg.LDAP_URL) {
+      try {
+        const rolesFromLdap = await ldapGetRoles(username).catch(()=>[]);
+        if (rolesFromLdap && rolesFromLdap.length > 0) roles = rolesFromLdap;
+        // (no dev fallback here) rely on LDAP for role membership
+      } catch (e) { /* ignore */ }
+    }
   }
   // include roles in access token
   const access = issueAccessToken({ username, roles });
@@ -686,15 +747,44 @@ app.post("/api/snap", authMiddleware, upload.single("snap"), handleUpload);
 async function handleGetSnaps(req, res) {
   // Ensure expired snaps are cleaned up before we list snaps so comments don't remain visible
   try { await cleanupExpiredSnaps(); } catch (e) { /* best-effort */ }
-
   const keys = await redis.keys(SNAP_PREFIX + "*");
-  const snaps = (await Promise.all(keys.map(k => redis.get(k)))).map(s => JSON.parse(s));
+  console.log('handleGetSnaps: redis keys count=', (keys||[]).length, 'poolReady=', !!poolReady, 'user=', req.user && req.user.username);
+  let snaps = [];
+  if (keys && keys.length > 0) {
+    console.log('handleGetSnaps: loading snaps from Redis');
+    snaps = (await Promise.all(keys.map(k => redis.get(k)))).map(s => JSON.parse(s));
+  } else if (pool && poolReady) {
+    // No snaps in Redis (maybe they were persisted directly to Postgres); fetch visible snaps from Postgres
+    try {
+      const username = req.user && req.user.username;
+      const sql = `SELECT id, sender, recipients, file, time, expiresAt, viewOnce, message FROM snaps
+                   WHERE (recipients IS NULL OR cardinality(recipients)=0 OR $1 = ANY(recipients) OR sender = $1)`;
+  const { rows } = await pool.query(sql, [username]);
+  console.log('Loaded', rows.length, 'snaps from Postgres for', username);
+  snaps = rows.map(r => ({
+        id: r.id,
+        sender: r.sender,
+        recipients: r.recipients || [],
+        file: r.file,
+        time: Number(r.time),
+        expiresAt: r.expiresat === null ? null : Number(r.expiresat),
+        viewOnce: !!r.viewonce,
+        message: r.message || '',
+        comments: [],
+        readBy: []
+      }));
+    } catch (e) {
+      console.error('Failed to load snaps from Postgres', e);
+      snaps = [];
+    }
+  }
   const now = Date.now();
   // Remove expired snaps (should be handled by Redis TTL, but double check)
   // Treat snaps with no expiresAt as indefinite (keep them)
   const validSnaps = snaps.filter(s => (s.expiresAt === null || s.expiresAt === undefined) || s.expiresAt > now);
   // Only return snaps visible to this user (public or recipient or sender)
   const visibleSnaps = validSnaps.filter(s => !s.recipients || s.recipients.length === 0 || s.recipients.includes(req.user.username) || s.sender === req.user.username);
+  console.log('handleGetSnaps: validSnaps=', validSnaps.length, 'visibleSnaps=', visibleSnaps.length);
   // Remove view-once snaps after fetch
   const viewOnceSnaps = visibleSnaps.filter(s => s.viewOnce);
   const normalSnaps = visibleSnaps.filter(s => !s.viewOnce);
@@ -790,6 +880,46 @@ app.get('/uploads/:file', authMiddleware, async (req, res) => {
         }
       }
     }
+    // If Redis doesn't have the snap, try Postgres as a fallback (useful after Redis restart)
+    if (pool && poolReady) {
+      try {
+        const { rows } = await pool.query('SELECT id, sender, recipients, file, time, expiresAt, viewOnce FROM snaps WHERE file = $1 LIMIT 1', [file]);
+        if (rows && rows.length > 0) {
+          const r = rows[0];
+          const snap = {
+            id: r.id,
+            sender: r.sender,
+            recipients: r.recipients || [],
+            file: r.file,
+            time: Number(r.time),
+            expiresAt: r.expiresat === null ? null : Number(r.expiresat),
+            viewOnce: !!r.viewonce
+          };
+          // If expired, treat as not found
+          if (snap.expiresAt && snap.expiresAt <= Date.now()) {
+            try { await pool.query('DELETE FROM snaps WHERE id = $1', [String(snap.id)]).catch(()=>{}); } catch(e){}
+            return res.status(404).send('Not found');
+          }
+          // permission check
+          if (!snap.recipients || snap.recipients.length === 0 || snap.sender === req.user.username || snap.recipients.includes(req.user.username)) {
+            // populate Redis for faster future access (best-effort)
+            try {
+              const key = SNAP_PREFIX + String(snap.id);
+              if (snap.expiresAt === null) {
+                await redis.set(key, JSON.stringify({ ...snap, comments: [], readBy: [] }));
+              } else {
+                const ttl = Math.max(1, Math.floor((snap.expiresAt - Date.now())/1000));
+                await redis.set(key, JSON.stringify({ ...snap, comments: [], readBy: [] }), { EX: ttl });
+              }
+            } catch (e) { /* best-effort */ }
+            return res.sendFile(path.resolve(cfg.UPLOADS_DIR || 'uploads', file));
+          }
+          return res.status(403).send('Forbidden');
+        }
+      } catch (e) {
+        console.error('Error querying Postgres for upload fallback', e);
+      }
+    }
     return res.status(404).send('Not found');
   } catch (err) {
     console.error('Error serving upload', err);
@@ -861,6 +991,106 @@ function requireRole(role) {
   };
 }
 
+// Admin endpoint: repopulate Redis from Postgres snaps (best-effort). Useful when Redis lost keys
+app.post('/admin/reconcile', authMiddleware, requireRole('admins'), async (req, res) => {
+  try {
+    if (!pool || !poolReady) return res.status(500).json({ ok: false, error: 'Postgres not ready' });
+    const rows = (await pool.query('SELECT id, sender, recipients, file, time, expiresAt, viewOnce, message FROM snaps')).rows;
+    let loaded = 0;
+    for (const r of rows) {
+      const snap = {
+        id: r.id,
+        sender: r.sender,
+        recipients: r.recipients || [],
+        file: r.file,
+        time: Number(r.time),
+        expiresAt: r.expiresat === null ? null : Number(r.expiresat),
+        viewOnce: !!r.viewonce,
+        message: r.message || '',
+        comments: [],
+        readBy: []
+      };
+      // only set in Redis if key missing
+      const key = SNAP_PREFIX + String(snap.id);
+      try {
+        const exists = await redis.exists(key);
+        if (!exists) {
+          if (snap.expiresAt === null) await redis.set(key, JSON.stringify(snap));
+          else {
+            const ttl = Math.max(1, Math.floor((snap.expiresAt - Date.now())/1000));
+            await redis.set(key, JSON.stringify(snap), { EX: ttl });
+          }
+          loaded++;
+        }
+      } catch (e) { /* best-effort, continue */ }
+    }
+    return res.json({ ok: true, loaded });
+  } catch (err) {
+    console.error('Reconcile failed', err);
+    return res.status(500).json({ ok: false });
+  }
+});
+
+// Background reconciliation job: periodically ensure Redis has keys for snaps stored in Postgres.
+// Runs in small batches and is best-effort to avoid overwhelming the DB/Redis.
+const RECONCILE_INTERVAL_SECONDS = Number(process.env.RECONCILE_INTERVAL_SECONDS || '60');
+const RECONCILE_BATCH_LIMIT = Number(process.env.RECONCILE_BATCH_LIMIT || '200');
+let reconcileRunning = false;
+async function reconcileOnce() {
+  if (reconcileRunning) return;
+  if (!pool || !poolReady) return;
+  reconcileRunning = true;
+  try {
+    // fetch a limited set of snaps
+    const { rows } = await pool.query('SELECT id, sender, recipients, file, time, expiresAt, viewOnce, message FROM snaps LIMIT $1', [RECONCILE_BATCH_LIMIT]);
+    let loaded = 0;
+    const now = Date.now();
+    for (const r of rows) {
+      try {
+        const id = String(r.id);
+        const key = SNAP_PREFIX + id;
+        const exists = await redis.exists(key).catch(()=>0);
+        if (exists) continue;
+        const snap = {
+          id: id,
+          sender: r.sender,
+          recipients: r.recipients || [],
+          file: r.file,
+          time: Number(r.time),
+          expiresAt: r.expiresat === null ? null : Number(r.expiresat),
+          viewOnce: !!r.viewonce,
+          message: r.message || '',
+          comments: [],
+          readBy: []
+        };
+        if (snap.expiresAt && snap.expiresAt <= now) {
+          // expired, remove from Postgres so it doesn't get re-added later
+          try { await pool.query('DELETE FROM snaps WHERE id = $1', [id]).catch(()=>{}); } catch (e) {}
+          continue;
+        }
+        if (snap.expiresAt === null) await redis.set(key, JSON.stringify(snap));
+        else {
+          const ttl = Math.max(1, Math.floor((snap.expiresAt - Date.now())/1000));
+          await redis.set(key, JSON.stringify(snap), { EX: ttl });
+        }
+        loaded++;
+      } catch (e) {
+        /* best-effort: skip problematic rows */
+      }
+    }
+    if (loaded > 0) console.log('Background reconcile: loaded', loaded, 'snaps into Redis');
+  } catch (err) {
+    console.error('Background reconcile failed', err);
+  } finally {
+    reconcileRunning = false;
+  }
+}
+
+// Start periodic background reconciliation
+setInterval(() => { reconcileOnce().catch(err => console.error('reconcileOnce error', err)); }, RECONCILE_INTERVAL_SECONDS * 1000);
+// Also run once after startup
+setTimeout(() => { reconcileOnce().catch(err => console.error('initial reconcileOnce error', err)); }, 5000);
+
 app.post('/admin/cleanup', authMiddleware, requireRole('admins'), async (req, res) => {
   try {
     await cleanupExpiredSnaps();
@@ -900,6 +1130,36 @@ app.get('/admin/snaps-counts', authMiddleware, requireRole('admins'), async (req
     return res.json({ ok: true, counts, total });
   } catch (err) {
     console.error('Failed to compute snaps counts', err);
+    return res.status(500).json({ ok: false });
+  }
+});
+
+// Admin endpoint: list snaps present in Postgres but missing in Redis (orphans)
+app.get('/admin/orphans', authMiddleware, requireRole('admins'), async (req, res) => {
+  try {
+    if (!pool || !poolReady) return res.status(500).json({ ok: false, error: 'Postgres not ready' });
+    const limit = Number(req.query.limit || RECONCILE_BATCH_LIMIT || 200);
+    // fetch snaps from Postgres up to limit
+    const { rows } = await pool.query('SELECT id, sender, recipients, file, time, expiresAt FROM snaps LIMIT $1', [limit]);
+    const now = Date.now();
+    const orphans = [];
+    for (const r of rows) {
+      try {
+        const id = String(r.id);
+        // skip expired rows
+        if (r.expiresat && Number(r.expiresat) <= now) continue;
+        const key = SNAP_PREFIX + id;
+        const exists = await redis.exists(key).catch(()=>0);
+        if (!exists) {
+          orphans.push({ id: id, sender: r.sender, recipients: r.recipients || [], file: r.file, time: Number(r.time), expiresAt: r.expiresat === null ? null : Number(r.expiresat) });
+        }
+      } catch (e) {
+        // skip problematic row
+      }
+    }
+    return res.json({ ok: true, count: orphans.length, orphans });
+  } catch (err) {
+    console.error('Failed to list orphan snaps', err);
     return res.status(500).json({ ok: false });
   }
 });

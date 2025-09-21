@@ -41,22 +41,29 @@ services:
       - LDAP_ORGANISATION=Example Org
       - LDAP_DOMAIN=example.org
       - LDAP_ADMIN_PASSWORD=admin
+      # Add explicit base DN for healthcheck and other services
+      - LDAP_BASE_DN=dc=example,dc=org
     ports:
       - "389:389"
     # use the upstream image and populate at runtime via ldapadd
+    # Healthcheck: bind as the admin user (anonymous searches may be denied).
     healthcheck:
-      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost:389 -b 'dc=example,dc=org' '(objectclass=*)' -LLL >/dev/null 2>&1 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "ldapsearch -x -H ldap://localhost:389 -D \"cn=admin,${LDAP_BASE_DN}\" -w \"${LDAP_ADMIN_PASSWORD}\" -b \"${LDAP_BASE_DN}\" \"(objectclass=*)\" -LLL >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 5
-      start_period: 5s
+      start_period: 15s
 
   phpldapadmin:
     image: osixia/phpldapadmin:0.9.0
     environment:
       - PHPLDAPADMIN_LDAP_HOSTS=ldap
+      # Enable HTTP site inside container for local dev (avoids HTTPS stub issues)
+      - PHPLDAPADMIN_HTTPS=false
     ports:
-      - "6443:6443"
+      # expose container HTTPS (443) on host 6443 for developer convenience
+      - "6080:80"
+      - "6443:443"
 
   # One-shot init service: waits for ldap to be ready then applies our canonical init.ldif.
   ldap-init:

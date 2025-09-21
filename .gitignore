@@ -2,6 +2,10 @@
 .env
 
 backend/uploads/*
+backend/users.txt
+backend/scripts/reconcile_test.sh
 
-ldap/init.ldif
+backend/ldap/init.ldif
+
+frontend/src/__tests__/*
 

@@ -34,3 +34,15 @@ docker compose exec ldap ldapsearch -x -H ldap://localhost:389 -D 'cn=admin,dc=e
 
 If you prefer a baked-in image bootstrap in the future I can try to re-enable it, but
 runtime population is a reliable default for local development.
+
+Cleanup
+ - Removed legacy `empty_ldif/` and duplicate debug files to keep this folder tidy.
+ - If you see an empty or leftover bootstrap folder (for example from older attempts),
+   it's safe to remove it. To re-run population after cleanup, use either the one-shot
+   compose init or the manual helper:
+
+```bash
+docker compose up --no-deps --abort-on-container-exit ldap-init
+# or
+./backend/scripts/ldap_populate.sh LDIF_PATH=backend/ldap/init.ldif
+```
